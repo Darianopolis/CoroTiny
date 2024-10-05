@@ -8,6 +8,7 @@
 #include <print>
 #include <chrono>
 #include <coroutine>
+#include <span>
 
 using namespace std::literals;
 
@@ -27,6 +28,8 @@ struct Step
     bool await_ready();
     void await_resume() noexcept;
     void await_suspend(Task task);
+
+    void Wait();
 };
 
 std::shared_ptr<Step>& CurrentStep()
@@ -34,6 +37,31 @@ std::shared_ptr<Step>& CurrentStep()
     thread_local std::shared_ptr<Step> current_step;
     return current_step;
 }
+
+void Step::Wait()
+    {
+        if (CurrentStep()) {
+            std::println("Cannot call blocking Step::Wait from step running on worker thread! Use co_await or schedule a new task");
+            std::terminate();
+        }
+
+        std::scoped_lock lock{ mutex };
+        if (complete) return;
+
+        std::atomic_bool done = false;
+
+        auto step = std::shared_ptr<Step>(new Step {
+            .run = [&] {
+                done = true;
+                done.notify_all();
+            },
+            .remainingDependencies = 1,
+        });
+
+        dependents.emplace_back(step);
+
+        done.wait(false);
+    }
 
 struct Executor
 {
@@ -82,13 +110,14 @@ struct Executor
             {
                 std::unique_lock lock{ mutex };
 
-                // std::println("[{}] waiting for job", id);
                 cv.wait(lock, [&]{
-                    // std::println("[{}] awoke, stop = {}, !queue.empty() = {}", id, stop, !queue.empty());
-                    return !queue.empty();
+                    return !queue.empty() || stop;
                 });
 
-                // TODO: Stopping conditions
+                if (stop) {
+                    std::println("Stop signal received, worker [{}] shutting down", id);
+                    return;
+                }
 
                 step = std::move(queue.front());
                 queue.pop_front();
@@ -114,21 +143,20 @@ struct Executor
 std::atomic_uint64_t id = 0;
 std::string StepName() { return std::format("Step-{}", ++id); }
 
-void Do(std::function<void()> func)
+std::shared_ptr<Step> Do(std::function<void()> func)
 {
-    exec.Enqueue(std::shared_ptr<Step>(new Step{
+    auto task = std::shared_ptr<Step>(new Step{
         .name = StepName(),
         .run = std::move(func),
-    }));
+    });
+    exec.Enqueue(task);
+    return task;
 }
 
 template<typename T>
-std::shared_ptr<Step> AfterAll(std::vector<std::function<T()>> fn, std::function<void()> afterfn)
+std::shared_ptr<Step> AfterAll(std::span<std::function<T()>> fn, std::shared_ptr<Step> after)
 {
     std::vector<std::shared_ptr<Step>> prequisites;
-    std::shared_ptr<Step> after = std::shared_ptr<Step>(new Step {
-        .run = std::move(afterfn),
-    });
 
     for (auto& f : fn) {
         prequisites.emplace_back(new Step {
@@ -138,7 +166,6 @@ std::shared_ptr<Step> AfterAll(std::vector<std::function<T()>> fn, std::function
         });
     }
 
-    after->name = StepName();
     after->remainingDependencies = uint32_t(prequisites.size());
 
     for (auto& preq : prequisites) {
@@ -238,9 +265,9 @@ struct Task
     handle_type handle{};
 };
 
-void Coro(std::function<Task()> coro)
+std::shared_ptr<Step> Coro(std::function<Task()> coro)
 {
-    Do([coro = std::move(coro)] {
+    return Do([coro = std::move(coro)]() mutable {
         coro();
     });
 }
@@ -255,7 +282,6 @@ void Step::await_resume() noexcept {}
 void Step::await_suspend(Task task)
 {
     auto cur_step = CurrentStep();
-
     auto step = std::shared_ptr<Step>(new Step {
         .run = [task = std::move(task)] {
             task.handle.resume();
@@ -272,9 +298,29 @@ void Step::await_suspend(Task task)
     }
 }
 
-std::shared_ptr<Step> AllOf(std::vector<std::function<Task()>> fn)
+struct AllOfHelper
 {
-    return AfterAll(fn, []{});
+    std::span<std::function<Task()>> tasks;
+
+    void await_resume() noexcept {}
+    bool await_ready() { return false; }
+    void await_suspend(Task task)
+    {
+        auto cur_step = CurrentStep();
+        auto step = std::shared_ptr<Step>(new Step {
+            .run = [task = std::move(task)] {
+                task.handle.resume();
+            },
+            .dependents = std::move(cur_step->dependents),
+        });
+
+        AfterAll<Task>(tasks, step);
+    }
+};
+
+AllOfHelper AllOf(std::vector<std::function<Task()>>&& fn)
+{
+    return AllOfHelper(fn);
 }
 
 // -----------------------------------------------------------------------------
@@ -295,26 +341,27 @@ int main()
     Coro([]() -> Task {
         std::println("A");
 
-        co_await *AllOf({
+        co_await AllOf({
             []() -> Task {
                 std::println("B");
-                co_await *AllOf({
-                    []() -> Task { std::println("B.1"); std::this_thread::sleep_for(2s); co_return; },
-                    []() -> Task { std::println("B.2"); std::this_thread::sleep_for(2s); co_return; },
+                co_await AllOf({
+                    []() -> Task { std::println("B.1"); std::this_thread::sleep_for(200ms); co_return; },
+                    []() -> Task { std::println("B.2"); std::this_thread::sleep_for(200ms); co_return; },
                 });
                 std::println("B Done");
             },
-            []() -> Task { std::println("C"); std::this_thread::sleep_for(1s); co_return; },
+            []() -> Task { std::println("C"); std::this_thread::sleep_for(100ms); co_return; },
         });
 
         std::println("D");
 
-        co_await *AllOf({
-            []() -> Task { std::println("E"); std::this_thread::sleep_for(1s); co_return; },
-            []() -> Task { std::println("F"); std::this_thread::sleep_for(1s); co_return; },
+        co_await AllOf({
+            []() -> Task { std::println("E"); std::this_thread::sleep_for(100ms); co_return; },
+            []() -> Task { std::println("F"); std::this_thread::sleep_for(100ms); co_return; },
         });
 
-
         std::println("G");
-    });
+    })->Wait();
+
+    std::println("All Complete");
 }
