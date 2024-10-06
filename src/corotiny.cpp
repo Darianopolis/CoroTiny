@@ -12,179 +12,42 @@
 
 using namespace std::literals;
 
-struct Task;
+// -----------------------------------------------------------------------------
 
-struct Step
-{
-    std::string name;
-    std::function<void()> run;
-
-    std::atomic_int remainingDependencies;
-    std::vector<std::shared_ptr<Step>> dependents;
-
-    bool complete = false;
-    std::mutex mutex;
-
-    bool await_ready();
-    void await_resume() noexcept;
-    void await_suspend(Task task);
-
-    void Wait();
-};
-
-std::shared_ptr<Step>& CurrentStep()
-{
-    thread_local std::shared_ptr<Step> current_step;
-    return current_step;
-}
-
-void Step::Wait()
-    {
-        if (CurrentStep()) {
-            std::println("Cannot call blocking Step::Wait from step running on worker thread! Use co_await or schedule a new task");
-            std::terminate();
-        }
-
-        std::scoped_lock lock{ mutex };
-        if (complete) return;
-
-        std::atomic_bool done = false;
-
-        auto step = std::shared_ptr<Step>(new Step {
-            .run = [&] {
-                done = true;
-                done.notify_all();
-            },
-            .remainingDependencies = 1,
-        });
-
-        dependents.emplace_back(step);
-
-        done.wait(false);
-    }
-
-struct Executor
-{
-    std::vector<std::jthread> workers;
-    std::deque<std::shared_ptr<Step>> queue;
-    std::mutex mutex;
-    std::condition_variable cv;
-
-    bool stop = false;
-
-    Executor(uint32_t num_threads)
-    {
-        for (uint32_t i = 0; i < num_threads; ++i) {
-            workers.emplace_back([this, i] { Worker(i); });
-        }
-    }
-
-    ~Executor()
-    {
-        {
-            std::scoped_lock lock{ mutex };
-            stop = true;
-        }
-        cv.notify_all();
-        std::println("Clearing out workers");
-        workers.clear();
-        std::println("Complete");
-    }
-
-    void Enqueue(std::shared_ptr<Step> step)
-    {
-        std::println("Enqueing: {}", step->name);
-
-        {
-            std::scoped_lock lock{ mutex };
-            queue.push_back(std::move(step));
-        }
-        cv.notify_one();
-    }
-
-    void Worker(uint32_t id)
-    {
-        for (;;) {
-            std::shared_ptr<Step> step;
-
-            {
-                std::unique_lock lock{ mutex };
-
-                cv.wait(lock, [&]{
-                    return !queue.empty() || stop;
-                });
-
-                if (stop) {
-                    std::println("Stop signal received, worker [{}] shutting down", id);
-                    return;
-                }
-
-                step = std::move(queue.front());
-                queue.pop_front();
-            }
-
-            std::println("[{}] Running step: {}", id, step->name);
-
-            CurrentStep() = step;
-            step->run();
-
-            std::scoped_lock step_lock{ step->mutex };
-            step->complete = true;
-
-            for (auto& dep : step->dependents) {
-                if (!--dep->remainingDependencies) {
-                    Enqueue(dep);
-                }
-            }
-        }
-    }
-} exec(4);
-
-std::atomic_uint64_t id = 0;
-std::string StepName() { return std::format("Step-{}", ++id); }
-
-std::shared_ptr<Step> Do(std::function<void()> func)
-{
-    auto task = std::shared_ptr<Step>(new Step{
-        .name = StepName(),
-        .run = std::move(func),
-    });
-    exec.Enqueue(task);
-    return task;
-}
-
-template<typename T>
-std::shared_ptr<Step> AfterAll(std::span<std::function<T()>> fn, std::shared_ptr<Step> after)
-{
-    std::vector<std::shared_ptr<Step>> prequisites;
-
-    for (auto& f : fn) {
-        prequisites.emplace_back(new Step {
-            .name = StepName(),
-            .run = std::move(f),
-            .dependents = { after }
-        });
-    }
-
-    after->remainingDependencies = uint32_t(prequisites.size());
-
-    for (auto& preq : prequisites) {
-        exec.Enqueue(std::move(preq));
-    }
-
-    return after;
-}
+#ifdef _MSC_VER
+#include <shared_mutex>
+using Mutex = std::shared_mutex;
+using CV = std::condition_variable_any;
+#else
+using Mutex = std::mutex;
+using CV = std::condition_variable;
+#endif
 
 // -----------------------------------------------------------------------------
+
+static const uint32_t num_threads = std::min(4u, std::thread::hardware_concurrency());
+
+// -----------------------------------------------------------------------------
+
+static std::atomic_uint32_t next_task_id = 0;
 
 struct Task
 {
     struct promise_type;
     using handle_type = std::coroutine_handle<promise_type>;
 
-    struct promise_type
+    struct alignas(64) promise_type
     {
+        Mutex mutex;
+
+        std::uint32_t id = next_task_id++;
+
         std::atomic_uint32_t ref_count = 0;
+
+        std::vector<Task> dependents;
+        std::atomic_int remainingDependencies;
+
+        bool complete = false;
 
         void acquire()
         {
@@ -202,7 +65,10 @@ struct Task
             return Task(*this);
         }
 
-        auto initial_suspend() { return std::suspend_never(); }
+        auto initial_suspend() {
+            // Optimize by only suspending initially in "defer" context
+            return std::suspend_always();
+        }
         auto final_suspend() noexcept { return std::suspend_always(); }
         auto return_void() {}
         void unhandled_exception() {}
@@ -263,105 +129,187 @@ struct Task
     }
 
     handle_type handle{};
-};
 
-std::shared_ptr<Step> Coro(std::function<Task()> coro)
-{
-    return Do([coro = std::move(coro)]() mutable {
-        coro();
-    });
-}
-
-bool Step::await_ready()
-{
-    return false;
-}
-
-void Step::await_resume() noexcept {}
-
-void Step::await_suspend(Task task)
-{
-    auto cur_step = CurrentStep();
-    auto step = std::shared_ptr<Step>(new Step {
-        .run = [task = std::move(task)] {
-            task.handle.resume();
-        },
-        .dependents = std::move(cur_step->dependents),
-    });
-
-    std::scoped_lock lock{ mutex };
-    if (complete) {
-        exec.Enqueue(std::move(step));
-    } else {
-        step->remainingDependencies = 1;
-        dependents.emplace_back(step);
-    }
-}
-
-struct AllOfHelper
-{
-    std::span<std::function<Task()>> tasks;
-
-    void await_resume() noexcept {}
-    bool await_ready() { return false; }
-    void await_suspend(Task task)
+    promise_type* operator->() const noexcept
     {
-        auto cur_step = CurrentStep();
-        auto step = std::shared_ptr<Step>(new Step {
-            .run = [task = std::move(task)] {
-                task.handle.resume();
-            },
-            .dependents = std::move(cur_step->dependents),
-        });
+        return &handle.promise();
+    }
 
-        AfterAll<Task>(tasks, step);
+    promise_type& promise() const noexcept
+    {
+        return handle.promise();
+    }
+
+    void wait()
+    {
+        std::atomic_bool done = false;
+
+        {
+            std::scoped_lock lock{ promise().mutex };
+            if (promise().complete) return;
+
+            auto task = [](auto& done) -> Task {
+                done = true;
+                done.notify_all();
+
+                co_return;
+            }(done);
+
+            task->remainingDependencies = 1;
+            promise().dependents.emplace_back(std::move(task));
+        }
+
+        done.wait(false);
+    }
+
+    // Make every Task a valid functor that returns itself
+    decltype(auto) operator()() const noexcept
+    {
+        return *this;
     }
 };
-
-AllOfHelper AllOf(std::vector<std::function<Task()>>&& fn)
-{
-    return AllOfHelper(fn);
-}
 
 // -----------------------------------------------------------------------------
 
-int main()
+struct Executor
 {
-    // Do([] {
-    //     std::println("A");
+    std::vector<std::jthread> workers;
+    std::deque<Task> queue;
+    Mutex mutex;
+    CV cv;
+    bool stop = false;
 
-    //     AfterAll(
-    //         {
-    //             [] { std::println("B"); },
-    //             [] { std::println("C"); },
-    //         },
-    //         [] { std::println("D"); });
-    // });
+    Executor(uint32_t num_workers)
+    {
+        for (uint32_t i = 0; i < num_workers; ++i) {
+            workers.emplace_back([this, i] { worker(i); });
+        }
+    }
 
-    Coro([]() -> Task {
-        std::println("A");
+    ~Executor()
+    {
+        {
+            std::scoped_lock lock{ mutex };
+            stop = true;
+        }
+        cv.notify_all();
+        std::println("Clearing out workers");
+        workers.clear();
+        std::println("Complete");
+    }
 
-        co_await AllOf({
-            []() -> Task {
+    void enqueue(Task task)
+    {
+        std::println("Enqueing: {}", task->id);
+
+        {
+            std::scoped_lock lock{ mutex };
+            queue.push_back(std::move(task));
+        }
+        cv.notify_one();
+    }
+
+    void worker(uint32_t id)
+    {
+        for (;;) {
+            Task task;
+
+            {
+                std::unique_lock queue_lock{ mutex };
+
+                cv.wait(queue_lock, [&]{
+                    return !queue.empty() || stop;
+                });
+
+                if (stop) {
+                    std::println("Stop signal received, worker [{}] shutting down", id);
+                    return;
+                }
+
+                task = std::move(queue.front());
+                queue.pop_front();
+            }
+
+            std::println("[{}] Resuming task: {}", id, task->id);
+
+            task.handle.resume();
+
+            if (task.handle.done()) {
+                std::scoped_lock task_lock{ task->mutex };
+                task->complete = true;
+
+                for (auto& dep : task->dependents) {
+                    if (!--dep->remainingDependencies) {
+                        enqueue(std::move(dep));
+                    }
+                }
+            }
+        }
+    }
+} exec(num_threads);
+
+// -----------------------------------------------------------------------------
+
+template<typename ...Fns>
+struct AllOf
+{
+    std::tuple<Fns&&...> task_fns;
+
+    AllOf(Fns&& ...fns)
+        : task_fns{std::make_tuple(fns...)}
+    {}
+
+    void await_resume() noexcept {}
+    bool await_ready() { return false; }
+    void await_suspend(Task cur_task)
+    {
+        cur_task->remainingDependencies = uint32_t(std::tuple_size_v<decltype(task_fns)>);
+        std::apply([&](auto&& ...fns) {
+            ([&](auto&& fn) {
+                auto task = fn();
+                task->dependents.emplace_back(cur_task);
+                exec.enqueue(std::move(task));
+            }(fns), ...);
+        }, task_fns);
+    }
+};
+
+// -----------------------------------------------------------------------------
+
+Task bar() { std::println("B.3"); co_return; }
+
+auto run() -> Task
+{
+    std::println("A");
+
+    co_await AllOf {
+        []() -> Task {
                 std::println("B");
-                co_await AllOf({
+                co_await AllOf {
                     []() -> Task { std::println("B.1"); std::this_thread::sleep_for(200ms); co_return; },
                     []() -> Task { std::println("B.2"); std::this_thread::sleep_for(200ms); co_return; },
-                });
+                    bar(),
+                };
                 std::println("B Done");
-            },
-            []() -> Task { std::println("C"); std::this_thread::sleep_for(100ms); co_return; },
-        });
+        },
+        []() -> Task { std::println("C"); std::this_thread::sleep_for(100ms); co_return; },
+    };
 
-        std::println("D");
+    std::println("D");
 
-        co_await AllOf({
-            []() -> Task { std::println("E"); std::this_thread::sleep_for(100ms); co_return; },
-            []() -> Task { std::println("F"); std::this_thread::sleep_for(100ms); co_return; },
-        });
+    co_await AllOf {
+        []() -> Task { std::println("E"); std::this_thread::sleep_for(100ms); co_return; },
+        []() -> Task { std::println("F"); std::this_thread::sleep_for(100ms); co_return; },
+    };
 
-        std::println("G");
-    })->Wait();
+    std::println("G");
+}
+
+int main()
+{
+    auto task = run();
+    exec.enqueue(task);
+    task.wait();
 
     std::println("All Complete");
 }
