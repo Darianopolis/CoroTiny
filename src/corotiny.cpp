@@ -25,10 +25,6 @@ using CV = std::condition_variable;
 
 // -----------------------------------------------------------------------------
 
-static const uint32_t num_threads = std::min(4u, std::thread::hardware_concurrency());
-
-// -----------------------------------------------------------------------------
-
 static std::atomic_uint32_t next_task_id = 0;
 
 struct Task
@@ -65,15 +61,21 @@ struct Task
             }
         }
 
-        Task get_return_object() {
+        Task get_return_object()
+        {
             return Task(*this);
         }
 
-        auto initial_suspend() {
-            // Optimize by only suspending initially in "defer" context
+        auto initial_suspend()
+        {
             return std::suspend_always();
         }
-        auto final_suspend() noexcept { return std::suspend_always(); }
+
+        auto final_suspend() noexcept
+        {
+            return std::suspend_always();
+        }
+
         auto return_void() {}
         void unhandled_exception() {}
     };
@@ -150,9 +152,17 @@ struct Task
     {
         return *this;
     }
+
+    // Task Awaiter
+
+    void await_resume() noexcept {}
+    bool await_ready() { return false; }
+    void await_suspend(Task cur_task);
 };
 
 // -----------------------------------------------------------------------------
+
+struct Executor* p_exec = nullptr;
 
 struct Executor
 {
@@ -176,9 +186,9 @@ struct Executor
             stop = true;
         }
         cv.notify_all();
-        std::println("Clearing out workers");
+        std::println("Executor :: Shutting down");
         workers.clear();
-        std::println("Complete");
+        std::println("Executor :: Shut down complete");
     }
 
     void enqueue(Task task)
@@ -219,8 +229,6 @@ struct Executor
         if (task.handle.done()) {
             std::scoped_lock task_lock{ task->mutex };
             task->complete = true;
-
-            // TODO: Only do this if someone is waiting on us
             task->complete.notify_all();
 
             for (auto& dep : task->dependents) {
@@ -239,7 +247,18 @@ struct Executor
     }
 };
 
-Executor exec(num_threads);
+// -----------------------------------------------------------------------------
+
+void Task::await_suspend(Task cur_task)
+{
+    std::scoped_lock lock{ promise().mutex };
+    if (promise().complete) {
+        p_exec->enqueue(std::move(cur_task));
+    } else {
+        cur_task->remaining_dependencies = 1;
+        promise().dependents.emplace_back(cur_task);
+    }
+}
 
 // -----------------------------------------------------------------------------
 
@@ -255,7 +274,7 @@ Task unpack_future(Future&& future)
     }
 
     struct Captured : Task::capture_base {
-        std::remove_cvref_t<Future> future;
+        std::remove_cvref_t<std::decay_t<Future>> future;
         Captured(Future&& arg)
             : future(std::forward<Future>(arg))
         {}
@@ -287,7 +306,7 @@ struct AllOf
             ([&](auto&& fn) {
                 auto task = unpack_future(std::forward<Fns>(*fn));
                 task->dependents.emplace_back(cur_task);
-                exec.enqueue(std::move(task));
+                p_exec->enqueue(std::move(task));
             }(fns), ...);
         }, task_fns);
     }
@@ -295,7 +314,7 @@ struct AllOf
 
 // -----------------------------------------------------------------------------
 
-Task bar() { std::println("B.3"); co_return; }
+Task bar() { std::println("B.3"); std::this_thread::sleep_for(300ms); co_return; }
 
 auto run() -> Task
 {
@@ -330,6 +349,9 @@ auto run() -> Task
 
 int main()
 {
+    Executor exec(16);
+    p_exec = &exec;
+
     auto task = run();
     exec.enqueue(task);
     task.wait();
